@@ -1,275 +1,265 @@
 package com.sample.updater;
 
-import org.json.simple.JSONArray;
-import org.json.simple.JSONObject;
-import com.sample.utilities.ReadConfigFile;
-import java.nio.charset.StandardCharsets;
+import com.sample.bean.API;
+import com.sample.bean.Operation;
+import com.sample.utilities.ConfigLoader;
+import com.sample.utilities.RestRequest;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import javax.net.ssl.*;
+import java.io.FileInputStream;
+import java.security.KeyStore;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Base64;
+import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import static com.sample.utilities.RestRequest.*;
-
 public class UpdateService {
 
-    private static final Logger LOGGER = Logger.getLogger(UpdateService.class.getName());
+    private static final Logger logger = Logger.getLogger(UpdateService.class.getName());
+    private static ConfigLoader configLoader;
+    private static RestRequest restRequest;
+    private static Gson gson = new Gson();
 
     public static void main(String[] args) {
-        ReadConfigFile configs = new ReadConfigFile();
-        String maxApiLimitProp = configs.getProperty("MAX.API.LIMIT");
-        int maxApiLimit = (maxApiLimitProp != null) ? Integer.parseInt(maxApiLimitProp) : 1000;
-        String adminusername = configs.getProperty("ADMIN.USERNAME");
-        String adminpassword = configs.getProperty("ADMIN.PASSWORD");
-        String publisherRestUrl = configs.getProperty("PUBLISHER.REST.URL");
-        String visibilityRestrictRoleList = configs.getProperty("DEVPORTAL.RESTRICTED.ROLE.LIST");
-        String [] visibilityRestrictRoleListArray = getArrayFromString(visibilityRestrictRoleList);
-        String visibilityRestrictRoleListToRemove = configs.getProperty("DEVPORTAL.RESTRICTED.ROLE.LIST.TO.REMOVE");
-        String [] visibilityRestrictRoleListToRemoveArray = getArrayFromString(visibilityRestrictRoleListToRemove);
-        String apiSkipList = configs.getProperty("API.SKIP.LIST");
-        String [] apiSkipListArray = getArrayFromString(apiSkipList);
-        String apiExplicitUpdateList = configs.getProperty("EXPLICIT.API.UPDATE.LIST");
-        String [] apiExplicitUpdateListArray = getArrayFromString(apiExplicitUpdateList);
-        boolean enableExplicitUpdateMode = Boolean.parseBoolean(configs.getProperty("ENABLE.EXPLICIT.API.UPDATE.MODE"));
-        long sleepTime = Long.parseLong(configs.getProperty("API.REDEPLOY.THREAD.SLEEP.TIME"));
-
-        LOGGER.info("***** Starting API Update *****");
-
-        // Create Basic accessToken by Encoding admin credentials
-        String accessToken = Base64.getEncoder().encodeToString((adminusername + ":" + adminpassword).getBytes(StandardCharsets.UTF_8));
-
-        // Get API List by calling /api/am/publisher/v3/apis
-        ArrayList<JSONObject> apiDetailsArray = getAPIList(publisherRestUrl, accessToken, maxApiLimit);
-
-        // Check if Running on Explicit API Update Mode
-        if (enableExplicitUpdateMode){
-            if (apiExplicitUpdateListArray.length==0){
-                LOGGER.log(Level.SEVERE, "***** Running in Explicit API Update Mode , But No APIs defined at EXPLICIT.API.UPDATE.LIST ");
-                LOGGER.log(Level.SEVERE, "Stopping Execution Of Client");
-                System.exit(0);
-            } else {
-                LOGGER.info("***** Running in Explicit API Update Mode , Hence only the listed APIs will be updated ");
-                apiDetailsArray = getFilteredApiDetailsList(apiDetailsArray,apiExplicitUpdateListArray);
-                LOGGER.info("***** Found " +apiDetailsArray.size()+ " APIs out of " +apiExplicitUpdateListArray.length+ " listed under EXPLICIT.API.UPDATE.LIST");
+        try {
+            if (args.length != 1) {
+                logger.log(Level.SEVERE, "Usage: java -jar UpdateClient.jar <config.properties>");
+                System.exit(1);
             }
-        }
 
-        if (apiDetailsArray != null && !apiDetailsArray.isEmpty()) {
-            LOGGER.info("***** Number Of APIs : " + apiDetailsArray.size());
-            LOGGER.info("");
+            // Load configuration
+            configLoader = new ConfigLoader(args[0]);
 
-            // Iterate through each API in the list
-            for (JSONObject apiDetails : apiDetailsArray) {
-                String apiId = (String) apiDetails.get("id");
-                LOGGER.info("***** Starting Processing API with ID :" + apiId);
-                String apiName = (String) apiDetails.get("name");
-                String apiContext = (String) apiDetails.get("context");
-                String apiVersion = (String) apiDetails.get("version");
-                String apiStatus = (String) apiDetails.get("lifeCycleStatus");
+            // Initialize SSL context
+            initializeSSLContext();
 
-                // If defined in apiSkipList skip this API
-                if (Arrays.asList(apiSkipListArray).contains(apiId)) {
-                    LOGGER.info("***** API : " + apiName + "|" + apiContext + "|" + apiVersion + " is defined in APISkipList. Hence Skipping this API ");
-                    LOGGER.info("***** Finished Processing API with Id : " + apiId);
-                    LOGGER.info("");
+            // Initialize REST request handler
+            restRequest = new RestRequest(configLoader);
+
+            // Get access token
+            String accessToken = restRequest.getAccessToken();
+            if (accessToken == null) {
+                logger.log(Level.SEVERE, "Failed to obtain access token");
+                System.exit(1);
+            }
+
+            // Get all APIs
+            List<API> apis = getAllAPIs(accessToken);
+            logger.log(Level.INFO, "***** Starting API Throttling Policy Update *****");
+            logger.log(Level.INFO, "***** Number Of APIs : " + apis.size());
+
+            // Get configuration for throttling policy update
+            String oldThrottlingPolicy = configLoader.getProperty("OLD.THROTTLING.POLICY");
+            String newThrottlingPolicy = configLoader.getProperty("NEW.THROTTLING.POLICY");
+            List<String> skipList = configLoader.getListProperty("API.SKIP.LIST");
+            boolean explicitMode = Boolean.parseBoolean(configLoader.getProperty("ENABLE.EXPLICIT.API.UPDATE.MODE"));
+            List<String> explicitList = configLoader.getListProperty("EXPLICIT.API.UPDATE.LIST");
+            int threadSleepTime = Integer.parseInt(configLoader.getProperty("API.REDEPLOY.THREAD.SLEEP.TIME"));
+
+            // Process each API
+            for (API api : apis) {
+                logger.log(Level.INFO, "");
+                logger.log(Level.INFO, "***** Starting Processing API with ID :" + api.getId());
+
+                // Check if API should be skipped
+                if (skipList.contains(api.getId())) {
+                    logger.log(Level.INFO, "***** API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion() + " is defined in APISkipList. Hence Skipping this API");
+                    logger.log(Level.INFO, "***** Finished Processing API with Id : " + api.getId());
                     continue;
                 }
-                // We only update the APIs which are in published state
-                if (!apiStatus.equalsIgnoreCase("published")) {
-                    LOGGER.info("***** API : " + apiName + "|" + apiContext + "|" + apiVersion + " is Not in PUBLISHED State. Currently in state: " + apiStatus + " - Skipping this API.");
+
+                // Check explicit mode
+                if (explicitMode && !explicitList.contains(api.getId())) {
+                    logger.log(Level.INFO, "***** Explicit mode enabled. API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion() + " is not in explicit list. Skipping.");
+                    logger.log(Level.INFO, "***** Finished Processing API with Id : " + api.getId());
+                    continue;
+                }
+
+                // Check API lifecycle status
+                if (!"PUBLISHED".equals(api.getLifeCycleStatus())) {
+                    logger.log(Level.INFO, "***** API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion() + " is not in PUBLISHED state. Current state: " + api.getLifeCycleStatus());
+                    logger.log(Level.INFO, "***** Finished Processing API with Id : " + api.getId());
+                    continue;
+                }
+
+                logger.log(Level.INFO, "***** API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion() + " is in PUBLISHED State. Proceeding with Update.");
+
+                // Get full API details
+                String apiDetails = restRequest.getAPIDetails(api.getId(), accessToken);
+                if (apiDetails == null) {
+                    logger.log(Level.SEVERE, "***** Failed to get API details for " + api.getId());
+                    continue;
+                }
+
+                // Update throttling policy in operations
+                String updatedApiDetails = updateOperationsThrottlingPolicy(apiDetails, oldThrottlingPolicy, newThrottlingPolicy);
+
+                if (updatedApiDetails == null) {
+                    logger.log(Level.INFO, "***** No operations found with throttling policy '" + oldThrottlingPolicy + "' for API : " + api.getName());
+                    logger.log(Level.INFO, "***** Finished Processing API with Id : " + api.getId());
+                    continue;
+                }
+
+                // Update the API with the modified JSON
+                String updateResponse = restRequest.updateAPI(api.getId(), updatedApiDetails, accessToken);
+                if (updateResponse != null) {
+                    logger.log(Level.INFO, "***** API throttling policy updated successfully.");
+
+                    // Handle revision management
+                    handleRevisionManagement(api, accessToken);
+
+                    logger.log(Level.INFO, "***** Completed Updating API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion());
                 } else {
-                    LOGGER.info("***** API : " + apiName + "|" + apiContext + "|" + apiVersion + " is in PUBLISHED State. Proceeding with Update.");
+                    logger.log(Level.SEVERE, "***** Failed to update API : " + api.getName());
+                }
 
-                    try {
-                        // Get API details by passing the apiId by calling /api/am/publisher/v3/apis/<apiId>
-                        JSONObject apiDetailsByApiId = getAPIDetailsByApiId(publisherRestUrl, accessToken, apiId);
+                logger.log(Level.INFO, "***** Finished Processing API with Id : " + api.getId());
 
-                        // Check if devportal visibility is PUBLIC
-                        String apiVisibility = (String) apiDetailsByApiId.get("visibility");
+                // Sleep to avoid overwhelming the server
+                Thread.sleep(threadSleepTime);
+            }
 
-                        // Update API visibility in object
-                        boolean isUpdated = updateVisibilityAndRoles(apiDetailsByApiId, apiVisibility,
-                                visibilityRestrictRoleListArray,
-                                visibilityRestrictRoleListToRemoveArray);
+            logger.log(Level.INFO, "***** API Throttling Policy Update Completed Successfully *****");
 
-                        if (isUpdated) {
-                            // Call update API
-                            if (updateApi(publisherRestUrl, accessToken, apiId, apiDetailsByApiId)) {
-                                LOGGER.info("***** API visibility and roles updated successfully.");
-                            } else {
-                                LOGGER.warning("***** Failed to update API visibility and roles.");
-                            }
-                        }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error in main execution", e);
+            System.exit(1);
+        }
+    }
 
-                        // Get revision list by passing API ID
-                        ArrayList<JSONObject> apiRevisionArray = getRevisionListByApiId(publisherRestUrl, accessToken, apiId);
-                        LOGGER.info("***** Revision Count for API : " + apiName + "|" + apiContext + "|" + apiVersion + " is : " + apiRevisionArray.size());
+    private static String updateOperationsThrottlingPolicy(String apiDetails, String oldPolicy, String newPolicy) {
+        try {
+            JsonObject apiJson = JsonParser.parseString(apiDetails).getAsJsonObject();
+            JsonArray operations = apiJson.getAsJsonArray("operations");
 
-                        // Handle Revision Deployment
-                        if (apiRevisionArray.size() < 5) {
-                            handleRevisionCreationAndDeployment(publisherRestUrl, accessToken, apiId, apiName, apiContext, apiVersion, apiRevisionArray, sleepTime);
-                        } else {
-                            LOGGER.info("***** Revision Count for API is 5. Deleting Oldest Revision.");
+            if (operations == null || operations.size() == 0) {
+                return null;
+            }
 
-                            // Find revision to delete
-                            String revisionIdToDelete = findRevisionToDelete(apiRevisionArray);
-
-                            // Delete revision and get remaining revisions
-                            ArrayList<JSONObject> remainingApiRevisionArray = deleteRevision(publisherRestUrl, accessToken, apiId, revisionIdToDelete);
-
-                            // Handle new revision creation and deployment
-                            handleRevisionCreationAndDeployment(publisherRestUrl, accessToken, apiId, apiName, apiContext, apiVersion, remainingApiRevisionArray, sleepTime);
-                        }
-                        LOGGER.info("***** Completed Updating API : " + apiName + "|" + apiContext + "|" + apiVersion);
-
-                    } catch (Exception e) {
-                        LOGGER.log(Level.SEVERE, "Error occurred while processing API with ID: " + apiId, e);
-                        LOGGER.log(Level.SEVERE, "Stopping Execution Of Client");
-                        System.exit(0);
+            boolean hasUpdates = false;
+            for (int i = 0; i < operations.size(); i++) {
+                JsonObject operation = operations.get(i).getAsJsonObject();
+                if (operation.has("throttlingPolicy")) {
+                    String currentPolicy = operation.get("throttlingPolicy").getAsString();
+                    if (currentPolicy.equals(oldPolicy)) {
+                        operation.addProperty("throttlingPolicy", newPolicy);
+                        hasUpdates = true;
+                        logger.log(Level.INFO, "***** Updated operation " + operation.get("target").getAsString() +
+                                " [" + operation.get("verb").getAsString() + "] from '" + oldPolicy + "' to '" + newPolicy + "'");
                     }
                 }
+            }
 
-                LOGGER.info("***** Finished Processing API with Id : " + apiId);
-                LOGGER.info("");
+            // Return the updated JSON string if there were updates, otherwise null
+            return hasUpdates ? apiJson.toString() : null;
 
-                try {
-                    Thread.sleep(sleepTime);
-                } catch (InterruptedException e) {
-                    LOGGER.log(Level.SEVERE, "Thread sleep interrupted", e);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error updating throttling policy", e);
+            return null;
+        }
+    }
+
+    private static List<API> getAllAPIs(String accessToken) {
+        List<API> allAPIs = new ArrayList<>();
+        int limit = Integer.parseInt(configLoader.getProperty("MAX.API.LIMIT"));
+        int offset = 0;
+
+        try {
+            while (true) {
+                String response = restRequest.getAPIs(limit, offset, accessToken);
+                if (response == null) {
+                    break;
+                }
+
+                JsonObject jsonResponse = JsonParser.parseString(response).getAsJsonObject();
+                JsonArray apiList = jsonResponse.getAsJsonArray("list");
+
+                if (apiList == null || apiList.size() == 0) {
+                    break;
+                }
+
+                for (int i = 0; i < apiList.size(); i++) {
+                    JsonObject apiJson = apiList.get(i).getAsJsonObject();
+                    API api = gson.fromJson(apiJson, API.class);
+                    allAPIs.add(api);
+                }
+
+                // Check pagination
+                JsonObject pagination = jsonResponse.getAsJsonObject("pagination");
+                if (pagination != null) {
+                    int total = pagination.get("total").getAsInt();
+                    if (offset + limit >= total) {
+                        break;
+                    }
+                    offset += limit;
+                } else {
+                    break;
                 }
             }
-        } else {
-            LOGGER.info("***** No APIs Found to Update . API updating completed ");
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error fetching APIs", e);
         }
 
-        LOGGER.info("............ API updating completed ............ ");
+        return allAPIs;
     }
 
-    public static String findRevisionToDelete(ArrayList<JSONObject> apiRevisionArray) {
-        String revisionIdToDelete = null;
-        long oldestCreatedTime = Long.MAX_VALUE;
+    private static void handleRevisionManagement(API api, String accessToken) {
+        try {
+            // Get revision count
+            int revisionCount = restRequest.getRevisionCount(api.getId(), accessToken);
+            logger.log(Level.INFO, "***** Revision Count for API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion() + " is : " + revisionCount);
 
-        for (JSONObject revision : apiRevisionArray) {
-            long createdTime = (long) revision.get("createdTime");
-            ArrayList<?> deploymentInfo = (ArrayList<?>) revision.get("deploymentInfo");
-
-            if (deploymentInfo.isEmpty() && createdTime < oldestCreatedTime) {
-                oldestCreatedTime = createdTime;
-                revisionIdToDelete = (String) revision.get("id");
-            }
-        }
-        return revisionIdToDelete;
-    }
-
-    public static ArrayList<JSONObject> buildDeployRevisionPayload(ArrayList<JSONObject> apiRevisionArray) {
-        ArrayList<JSONObject> payload = new ArrayList<>();
-        for (JSONObject revision : apiRevisionArray) {
-            JSONArray deploymentInfo = (JSONArray) revision.get("deploymentInfo");
-            if (deploymentInfo != null) {
-                for (Object obj : deploymentInfo) {
-                    JSONObject deployment = (JSONObject) obj;
-                    JSONObject formattedDeployment = new JSONObject();
-                    formattedDeployment.put("name", deployment.get("name"));
-                    formattedDeployment.put("vhost", deployment.get("vhost"));
-                    formattedDeployment.put("displayOnDevportal", deployment.get("displayOnDevportal"));
-                    payload.add(formattedDeployment);
-                }
-            }
-        }
-        return payload;
-    }
-
-    public static String[] getArrayFromString(String apiSkipList) {
-        if (apiSkipList == null || apiSkipList.isEmpty()) {
-            return new String[0];  // Return an empty array if input is invalid
-        }
-        apiSkipList = apiSkipList.trim();
-        if (apiSkipList.startsWith("[") && apiSkipList.endsWith("]")) {
-            // Remove the surrounding brackets
-            apiSkipList = apiSkipList.substring(1, apiSkipList.length() - 1).trim();
-        } else {
-            throw new IllegalArgumentException("Input must be a list formatted with square brackets.");
-        }
-        // Split by comma and trim spaces from each element
-        String[] array = apiSkipList.split(",");
-        for (int i = 0; i < array.length; i++) {
-            array[i] = array[i].trim();
-        }
-        return array;
-    }
-
-    public static ArrayList<JSONObject> getFilteredApiDetailsList(ArrayList<JSONObject> apiDetailsArray , String[] apiExplicitUpdateListArray){
-        // Convert the String array to a List
-        ArrayList<String> stringList = new ArrayList<>(Arrays.asList(apiExplicitUpdateListArray));
-        ArrayList<JSONObject> filteredArrayList = new ArrayList<>();
-        // Filter the apiDetailsArray
-        for (JSONObject jsonObject : apiDetailsArray) {
-            String id = (String) jsonObject.get("id");
-            if (stringList.contains(id)) {
-                filteredArrayList.add(jsonObject);
-            }
-        }
-        return filteredArrayList;
-    }
-
-    public static boolean updateVisibilityAndRoles(JSONObject apiDetails, String currentVisibility,
-                                                   String[] visibilityRestrictRoles,
-                                                   String[] rolesToRemove) {
-
-        if (!"PRIVATE".equalsIgnoreCase(currentVisibility)) {
-            boolean isUpdated = false;
-            JSONArray visibleRoles = (JSONArray) apiDetails.get("visibleRoles");
-            if (visibleRoles == null) {
-                visibleRoles = new JSONArray(); // Initialize if null
-            }
-
-            // Add missing roles
-            for (String role : visibilityRestrictRoles) {
-                if (!visibleRoles.contains(role)) {
-                    visibleRoles.add(role);
-                    isUpdated = true;
+            // Delete oldest revision if count is 5
+            if (revisionCount >= 5) {
+                logger.log(Level.INFO, "***** Revision Count for API is " + revisionCount + ". Deleting Oldest Revision.");
+                String oldestRevisionId = restRequest.getOldestRevisionId(api.getId(), accessToken);
+                if (oldestRevisionId != null) {
+                    restRequest.deleteRevision(api.getId(), oldestRevisionId, accessToken);
                 }
             }
 
-            // Remove unwanted roles
-            for (String role : rolesToRemove) {
-                if (visibleRoles.contains(role)) {
-                    visibleRoles.remove(role);
-                    isUpdated = true;
-                }
+            // Create new revision
+            String newRevisionId = restRequest.createRevision(api.getId(), accessToken);
+            if (newRevisionId != null) {
+                logger.log(Level.INFO, "***** New Revision created with id : " + newRevisionId + " for API : " + api.getName() + "|" + api.getContext() + "|" + api.getVersion());
+
+                // Deploy revision
+                String deploymentPayload = restRequest.getDeploymentEnvironments(api.getId(), accessToken);
+                logger.log(Level.INFO, "***** New Revision going to be deployed with payload : " + deploymentPayload);
+                restRequest.deployRevision(api.getId(), newRevisionId, deploymentPayload, accessToken);
             }
 
-            // Adjust visibility if no roles are present
-            if (visibleRoles.isEmpty() && !"PUBLIC".equalsIgnoreCase(currentVisibility)) {
-                apiDetails.put("visibility", "PUBLIC");
-                isUpdated = true;
-            } else if (!visibleRoles.isEmpty() && !"RESTRICTED".equalsIgnoreCase(currentVisibility)) {
-                apiDetails.put("visibility", "RESTRICTED");
-                isUpdated = true;
-            }
-
-            apiDetails.put("visibleRoles", visibleRoles);
-            return isUpdated;
-        } else {
-            LOGGER.info("***** API visibility is set to PRIVATE . Hence do not update .");
-            return false;
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error in revision management", e);
         }
     }
 
-    private static void handleRevisionCreationAndDeployment(String publisherRestUrl, String accessToken, String apiId, String apiName, String apiContext, String apiVersion, ArrayList<JSONObject> apiRevisionArray, long sleepTime) throws InterruptedException {
-        // Create new API revision
-        JSONObject newApiRevision = createRevision(publisherRestUrl, accessToken, apiId);
-        String newApiRevisionId = (String) newApiRevision.get("id");
-        LOGGER.info("***** New Revision created with id : " + newApiRevisionId + " for API : " + apiName + "|" + apiContext + "|" + apiVersion);
+    private static void initializeSSLContext() {
+        try {
+            String truststorePath = configLoader.getProperty("TRUSTSTORE.PATH");
+            String truststorePassword = configLoader.getProperty("TRUSTSTORE.PASSWORD");
 
-        // Create payload to deploy new API revision
-        ArrayList<JSONObject> deployRevisionPayload = buildDeployRevisionPayload(apiRevisionArray);
-        LOGGER.info("***** New Revision going to be deployed with payload : " + deployRevisionPayload.toString());
+            KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+            try (FileInputStream trustStoreStream = new FileInputStream(truststorePath)) {
+                trustStore.load(trustStoreStream, truststorePassword.toCharArray());
+            }
 
-        // Deploy new API revision
-        ArrayList<JSONObject> newDeployedRevisionDetails = deployRevision(publisherRestUrl, accessToken, apiId, newApiRevisionId, deployRevisionPayload);
-        Thread.sleep(sleepTime);
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init(trustStore);
+
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, tmf.getTrustManagers(), null);
+
+            HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.getSocketFactory());
+            HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
+
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to initialize SSL context", e);
+            System.exit(1);
+        }
     }
-
 }
